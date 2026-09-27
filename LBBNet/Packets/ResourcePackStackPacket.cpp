@@ -21,10 +21,10 @@ void sendResourcePacksStack(int sock, sockaddr_in clientAddr, ClientState& state
     writeVarInt(packet, 0); // TexturePacks count — none served
   
     // Base Game Version — must match the version the connecting client is
-    // actually running (protocol 2168 == 1.26.44.x here), and must agree
+    // actually running (protocol 2193 == 1.26.51.x here), and must agree
     // with the same field in StartGamePacket.cpp. A stale/mismatched value
     // is a known cause of the client silently rejecting the session.
-    writeString(packet, "1.26.44"); // Base Game Version  
+    writeString(packet, "1.26.51"); // Base Game Version  
   
     // Experiments — per gophertunnel's ResourcePackStack.Marshal(), this
     // uses protocol.SliceUint32Length: a fixed 4-byte little-endian uint32

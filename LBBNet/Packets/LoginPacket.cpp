@@ -5,6 +5,7 @@
 #include "PlayStatusPacket.h"
 #include "ResourcePacksInfoPacket.h"
 #include "HandshakePacket.h"
+#include "Encryption.h"
 #include <iostream>
 
 using namespace std;
@@ -22,6 +23,21 @@ string decodeJwtPayload(const string& jwt) {
     string payloadB64 = jwt.substr(firstDot + 1, secondDot - firstDot - 1);
     vector<uint8_t> raw = base64UrlDecode(payloadB64);
     return string(raw.begin(), raw.end());
+}
+
+// Splits a JWT into its signing input ("header.payload", still
+// base64url-encoded, exactly the bytes that were signed) and its
+// signature segment (also still base64url-encoded). Returns false if the
+// token doesn't have exactly the two dots a JWT requires.
+bool splitJwt(const string& jwt, string& outSigningInput, string& outSignatureB64Url) {
+    size_t firstDot = jwt.find('.');
+    if (firstDot == string::npos) return false;
+    size_t secondDot = jwt.find('.', firstDot + 1);
+    if (secondDot == string::npos) return false;
+
+    outSigningInput = jwt.substr(0, secondDot);
+    outSignatureB64Url = jwt.substr(secondDot + 1);
+    return true;
 }
 
 // The chain and clientData fields are each prefixed with their length as a
@@ -68,6 +84,57 @@ vector<string> extractChainTokens(const string& chainJson) {
     return tokens;
 }
 
+// Walks a chain array in order and verifies each link's signature against
+// the PREVIOUS link's declared "identityPublicKey" -- per Minecraft Wiki's
+// Bedrock Login Sequence documentation: "each new claim is validated with
+// the key specified in the previous one, with the first key being a self
+// signed key." The first token is therefore verified against its OWN
+// embedded identityPublicKey (self-signed just proves the client holds
+// the matching private key, not identity). Returns true only if every
+// signature in the chain checks out AND at least one link was signed
+// using a key that exactly matches Mojang's known root key -- meaning
+// that link (and everything chained after it) was genuinely produced by
+// Mojang's Xbox Live authentication service, not just self-signed by an
+// arbitrary client.
+//
+// NOT covered yet: the newer PlayFab-issued single-token format (the
+// "ipt":"PlayFab", "cpk"-bearing path handled earlier in this file) has a
+// different structure this function doesn't attempt to verify -- that
+// path still extracts identity fields but leaves xboxAuthenticated false,
+// same as before this change.
+bool verifyLoginChain(const vector<string>& tokens) {
+    if (tokens.empty()) return false;
+
+    string previousLinkKey; // key that should verify the CURRENT token
+    bool sawMojangKey = false;
+
+    for (size_t i = 0; i < tokens.size(); i++) {
+        const string& token = tokens[i];
+        string payload = decodeJwtPayload(token);
+        if (payload.empty()) return false;
+
+        string thisLinkKey = jsonExtractString(payload, "identityPublicKey");
+        if (thisLinkKey.empty()) return false;
+
+        string verifyingKey = (i == 0) ? thisLinkKey : previousLinkKey;
+
+        string signingInput, signatureB64Url;
+        if (!splitJwt(token, signingInput, signatureB64Url)) return false;
+
+        if (!verifyES384Signature(signingInput, signatureB64Url, verifyingKey)) {
+            return false; // one bad signature invalidates the whole chain
+        }
+
+        if (verifyingKey == kMojangRootPublicKeyBase64) {
+            sawMojangKey = true;
+        }
+
+        previousLinkKey = thisLinkKey;
+    }
+
+    return sawMojangKey;
+}
+
 } // namespace
 
 LoginIdentity extractLoginIdentity(const string& chainJson) {
@@ -107,13 +174,22 @@ LoginIdentity extractLoginIdentity(const string& chainJson) {
 
     // Older chain-array format: {"chain":["<jwt>", ...]}, identity fields
     // nested under whichever link carries an "extraData" claim.
-    for (const string& token : extractChainTokens(chainJson)) {
+    // Verify the whole chain's signatures up front (see verifyLoginChain
+    // above) -- this used to just be extracted and trusted; now a chain
+    // whose signatures don't check out, or that was never actually signed
+    // by Mojang, is flagged via xboxAuthenticated rather than silently
+    // treated the same as a real Xbox Live login.
+    vector<string> chainTokens = extractChainTokens(chainJson);
+    bool chainVerified = verifyLoginChain(chainTokens);
+
+    for (const string& token : chainTokens) {
         string payload = decodeJwtPayload(token);
         if (payload.empty()) continue;
 
         // Only the Mojang/Xbox-signed link in the chain carries extraData;
-        // the rest just carry public keys for signature verification, which
-        // we're not doing yet. Skip anything that isn't the identity token.
+        // the rest just carry public keys used to verify the next link
+        // (see verifyLoginChain above). Skip anything that isn't the
+        // identity token.
         size_t extraDataPos = payload.find("\"extraData\"");
         if (extraDataPos == string::npos) continue;
 
@@ -143,11 +219,76 @@ LoginIdentity extractLoginIdentity(const string& chainJson) {
         // payload rather than extraDataObj.
         identity.publicKeyBase64 = jsonExtractString(payload, "identityPublicKey");
         identity.valid = !identity.displayName.empty();
+        identity.xboxAuthenticated = identity.valid && chainVerified;
 
         if (identity.valid) break; // found the token that matters
     }
 
     return identity;
+}
+
+ClientSkinData extractClientSkinData(const string& payload) {
+    ClientSkinData skin;
+    if (payload.empty()) return skin;
+
+    skin.skinId = jsonExtractString(payload, "SkinId");
+
+    string resourcePatchB64 = jsonExtractString(payload, "SkinResourcePatch");
+    if (!resourcePatchB64.empty()) {
+        vector<uint8_t> raw = base64Decode(resourcePatchB64);
+        skin.skinResourcePatch = string(raw.begin(), raw.end());
+    }
+
+    skin.skinImageWidth  = (int32_t)jsonExtractInt(payload, "SkinImageWidth");
+    skin.skinImageHeight = (int32_t)jsonExtractInt(payload, "SkinImageHeight");
+    string skinDataB64 = jsonExtractString(payload, "SkinData");
+    if (!skinDataB64.empty()) {
+        skin.skinImageData = base64Decode(skinDataB64);
+    }
+
+    skin.capeId          = jsonExtractString(payload, "CapeId");
+    skin.capeImageWidth  = (int32_t)jsonExtractInt(payload, "CapeImageWidth");
+    skin.capeImageHeight = (int32_t)jsonExtractInt(payload, "CapeImageHeight");
+    string capeDataB64 = jsonExtractString(payload, "CapeData");
+    if (!capeDataB64.empty()) {
+        skin.capeImageData = base64Decode(capeDataB64);
+    }
+
+    string geometryB64 = jsonExtractString(payload, "SkinGeometryData");
+    if (!geometryB64.empty()) {
+        vector<uint8_t> raw = base64Decode(geometryB64);
+        skin.skinGeometryData = string(raw.begin(), raw.end());
+    }
+    // Real field name per gophertunnel/PMMP client-data schema; not present
+    // in minecraft-data's steve.json template (that default skin predates
+    // this field), so this stays empty for clients/tools that don't send
+    // it -- matches this file's previous inert default.
+    skin.skinGeometryDataVersion = jsonExtractString(payload, "SkinGeometryDataEngineVersion");
+
+    string animDataB64 = jsonExtractString(payload, "SkinAnimationData");
+    if (!animDataB64.empty()) {
+        vector<uint8_t> raw = base64Decode(animDataB64);
+        skin.skinAnimationData = string(raw.begin(), raw.end());
+    }
+
+    string armSizeStr = jsonExtractString(payload, "ArmSize");
+    if (!armSizeStr.empty()) skin.armSize = armSizeStr;
+
+    skin.personaSkin       = jsonExtractBool(payload, "PersonaSkin", false);
+    skin.premiumSkin       = jsonExtractBool(payload, "PremiumSkin", false);
+    skin.capeOnClassicSkin = jsonExtractBool(payload, "CapeOnClassicSkin", false);
+
+    // Only treat this as a usable real skin once we actually have skin
+    // pixel data AND dimensions that are internally consistent with it --
+    // a client that sent no clientData at all (or one we failed to parse)
+    // should fall back to the placeholder skin in PlayerListPacket.cpp,
+    // not send a broken 0-byte "skin".
+    skin.valid = !skin.skinImageData.empty()
+              && skin.skinImageWidth > 0
+              && skin.skinImageHeight > 0
+              && (size_t)(skin.skinImageWidth * skin.skinImageHeight * 4) == skin.skinImageData.size();
+
+    return skin;
 }
 
 void handleLogin(int sock, sockaddr_in clientAddr, ClientState& state,
@@ -173,15 +314,17 @@ void handleLogin(int sock, sockaddr_in clientAddr, ClientState& state,
     }
     string chainJson = readLPStringLE(data, offset);
 
-    // Client data JWT (skin, device info, etc.) follows the chain. We read
-    // it so `offset` stays correct for anyone parsing further, but don't
-    // need its contents for identity extraction. Same 4-byte-LE length
-    // prefix as the chain field above.
+    // Client data JWT (skin, device info, etc.) follows the chain, same
+    // 4-byte-LE length prefix as the chain field above. Unlike the chain
+    // (a JSON array of JWTs), this is a single raw JWT string -- its
+    // payload holds the skin/appearance fields directly at the top level.
+    string clientDataJwt;
     if (offset < data.size()) {
-        readLPStringLE(data, offset);
+        clientDataJwt = readLPStringLE(data, offset);
     }
 
     LoginIdentity identity = extractLoginIdentity(chainJson);
+    ClientSkinData skin = extractClientSkinData(decodeJwtPayload(clientDataJwt));
 
     cout << "===========================================\n";
     cout << "Login Packet\n";
@@ -191,8 +334,15 @@ void handleLogin(int sock, sockaddr_in clientAddr, ClientState& state,
         cout << "  Display Name:     " << identity.displayName << "\n";
         cout << "  XUID:             " << identity.xuid << "\n";
         cout << "  Identity (UUID):  " << identity.identityUUID << "\n";
+        cout << "  Xbox Authenticated: " << (identity.xboxAuthenticated ? "yes (chain verified against Mojang's root key)" : "no (self-signed / unverified chain)") << "\n";
     } else {
         cout << "  [!] Could not extract identity from certificate chain\n";
+    }
+    if (skin.valid) {
+        cout << "  Skin:              " << skin.skinImageWidth << "x" << skin.skinImageHeight
+             << " (" << (skin.personaSkin ? "persona" : "classic") << ")\n";
+    } else {
+        cout << "  [!] No usable skin in client data -- PlayerList will use the placeholder skin\n";
     }
     cout << "===========================================\n";
 
@@ -200,6 +350,26 @@ void handleLogin(int sock, sockaddr_in clientAddr, ClientState& state,
     state.displayName    = identity.displayName;
     state.xuid           = identity.xuid;
     state.identityUUID   = identity.identityUUID;
+
+    state.hasSkinData = skin.valid;
+    if (skin.valid) {
+        state.skinId                 = skin.skinId;
+        state.skinResourcePatch      = skin.skinResourcePatch;
+        state.skinImageWidth         = skin.skinImageWidth;
+        state.skinImageHeight        = skin.skinImageHeight;
+        state.skinImageData          = skin.skinImageData;
+        state.capeId                 = skin.capeId;
+        state.capeImageWidth         = skin.capeImageWidth;
+        state.capeImageHeight        = skin.capeImageHeight;
+        state.capeImageData          = skin.capeImageData;
+        state.skinGeometryData       = skin.skinGeometryData;
+        state.skinGeometryDataVersion = skin.skinGeometryDataVersion;
+        state.skinAnimationData      = skin.skinAnimationData;
+        state.armSize                = skin.armSize;
+        state.personaSkin            = skin.personaSkin;
+        state.premiumSkin            = skin.premiumSkin;
+        state.capeOnClassicSkin      = skin.capeOnClassicSkin;
+    }
 
     if (identity.valid && !identity.publicKeyBase64.empty()) {
         // A real Xbox Live login — e.g. the official Minecraft client,

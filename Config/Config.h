@@ -17,11 +17,21 @@ struct ServerConfig {
     std::string bindAddress = "0.0.0.0";
 
     std::string motd = "LBCore Bedrock Server";
-    std::string levelName = "Test World";
+
+    // This is just the world's NAME, not a path. The actual folder that
+    // gets created/opened on disk is always "worlds/<levelName>" (see
+    // executer.cpp) — matching the PocketMine/most-server-software
+    // convention of one top-level "worlds" directory holding every
+    // world, rather than dumping world folders next to the executable.
+    std::string levelName = "World";
     std::string gamemode = "Survival";
     int maxPlayers = 10;
-    int protocolVersion = 1001;
-    std::string versionName = "26.33";
+    int protocolVersion = 2193;
+    std::string versionName = "26.51";
+
+    // Registers the built-in commands (/help /list /pos /version) in
+    // AvailableCommands. Set to false to send the original empty command list.
+    bool enableCommands = true;
 };
 
 // Reads key=value pairs from a properties file (default:

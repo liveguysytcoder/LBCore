@@ -9,14 +9,17 @@ void sendJoinMessage(int sock, sockaddr_in clientAddr, ClientState& state, const
     vector<uint8_t> packet;
     writeVarInt(packet, 9);
 
-    writeUByte(packet, 2);  // type = Translation
-    writeBool(packet, true); // needs_translation
-    writeString(packet, "%multiplayer.player.joined");
+    writeBool(packet, true);    // needs_translation
+    writeUByte(packet, 2);      // category = parameters
+    writeUByte(packet, 2);      // type = translation
+
+    writeString(packet, "%multiplayer.player.joined"); // message (translation key)
     writeVarInt(packet, 1); // parameters: array count = 1
     writeString(packet, playerName);
+
     writeString(packet, ""); // xuid
     writeString(packet, ""); // platform_chat_id
-    writeBool(packet, false); // has_filtered_message
+    writeBool(packet, false); // has_filtered_message (false -> filtered_message omitted)
 
     queueGamePacket(state, packet);
     cout << "[Bedrock] Sent join message for " << playerName << "\n";

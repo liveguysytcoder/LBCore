@@ -7,39 +7,38 @@
 using namespace std;
 
 void sendBiomeDefinitionList(int sock, sockaddr_in clientAddr, ClientState& state) {
-    // Gamepacket header (varint) = 122 (0x7A), same ID as before — only
-    // the payload format changed. Per-entry field order/types below were
-    // read directly off a real capture's JSON (protodef preserves
-    // declared field order, so JSON key order == wire order):
-    //   name_index        VarInt   -- index into string_list, this entry's own name
-    //   biome_id          u16 LE   -- constant 65535 in every real entry; a dead
-    //                                 legacy-id sentinel, not meaningfully used
-    //   temperature       f32 LE
-    //   downfall          f32 LE
-    //   snow_foliage      f32 LE
-    //   depth             f32 LE
-    //   scale             f32 LE
-    //   map_water_colour  i32 LE   -- packed ARGB, cosmetic only
-    //   rain              bool (1 byte)
-    //   tags              VarInt count, then VarInt[] -- each indexes string_list too
-    // Top level: VarInt count + biome_definitions[], then VarInt count + string_list[]
-    // (each string is the same length-prefixed String type used everywhere
-    // else in this codebase).
-    //
-    // Confidence: HIGH on the array/field shapes (matches the reference
-    // capture exactly) and on temperature/downfall/depth/scale/rain/tags
-    // (plain float/bool/varint, unambiguous from the captured values).
-    // biome_id as u16-not-varint and map_water_colour as i32-not-varint
-    // are inferred (see BiomeDefinitionData.h's header comment) rather
-    // than independently confirmed byte-for-byte -- if a real client
-    // still rejects this packet, those two fields are the first things to
-    // re-check.
+    // Gamepacket header (varint) = 122 (0x7A). Field layout below is taken
+    // directly from minecraft-data's protocol.json for bedrock 1.26.40
+    // (node_modules/minecraft-data/minecraft-data/data/bedrock/1.26.40/protocol.json,
+    // types.BiomeDefinition / types.BiomeChunkGeneration), NOT reconstructed
+    // from a capture. Confirmed real layout per entry:
+    //   name_index        li16 (SIGNED 16-bit) -- NOT varint
+    //   biome_id          lu16
+    //   temperature       lf32
+    //   downfall          lf32
+    //   snow_foliage      lf32
+    //   depth             lf32
+    //   scale             lf32
+    //   map_water_colour  li32
+    //   rain              bool
+    //   tags              option< varint-count array of lu16 > -- option means a
+    //                     presence bool comes first; array elements are lu16,
+    //                     NOT varint
+    //   chunk_generation  option<BiomeChunkGeneration> -- a field this codebase
+    //                     was missing entirely. We don't generate real
+    //                     chunk-gen data server-side, so we send "absent"
+    //                     (a single false byte), but the field must still be
+    //                     present on the wire or the client misreads the next
+    //                     entry's bytes as this one's contents and desyncs
+    //                     for the rest of the packet.
+    // Top level (packet_biome_definition_list): VarInt count + biome_definitions[],
+    // then VarInt count + string_list[] -- this part was already correct.
     vector<uint8_t> packet;
     writeVarInt(packet, 122);
 
     writeVarInt(packet, (uint32_t)kBiomeDefinitions.size());
     for (const BiomeDefEntry& def : kBiomeDefinitions) {
-        writeVarInt(packet, def.nameIndex);
+        writeShort(packet, (int16_t)def.nameIndex);
         writeUShort(packet, def.biomeId);
         writeFloat(packet, def.temperature);
         writeFloat(packet, def.downfall);
@@ -48,8 +47,17 @@ void sendBiomeDefinitionList(int sock, sockaddr_in clientAddr, ClientState& stat
         writeFloat(packet, def.scale);
         writeInt(packet, def.mapWaterColour);
         writeBool(packet, def.rain);
-        writeVarInt(packet, (uint32_t)def.tags.size());
-        for (uint32_t tag : def.tags) writeVarInt(packet, tag);
+
+        // tags: option<array<varint count, lu16>>
+        bool hasTags = !def.tags.empty();
+        writeBool(packet, hasTags);
+        if (hasTags) {
+            writeVarInt(packet, (uint32_t)def.tags.size());
+            for (uint32_t tag : def.tags) writeUShort(packet, (uint16_t)tag);
+        }
+
+        // chunk_generation: option<BiomeChunkGeneration> -- always absent for now
+        writeBool(packet, false);
     }
 
     writeVarInt(packet, (uint32_t)kBiomeStringList.size());

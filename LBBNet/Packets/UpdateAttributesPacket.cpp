@@ -1,26 +1,17 @@
 #include "UpdateAttributesPacket.h"
 #include "DataTypeHelper.h"
 #include "GamePacketSender.h"
+#include <climits>
+#include <cfloat>
 #include <iostream>
 
 using namespace std;
 
 namespace {
 
-// Writes a single Attribute (AttributeData) entry. Field order confirmed
-// directly against Mojang's own official protocol docs for protocol 2168
-// (this project's target, 1.26.44): Min, Max, Current, DefaultMin,
-// DefaultMax, Default, Name, Modifiers -- in that exact order. The
-// previous version wrote Name FIRST and Current/Max/Min out of order,
-// which is what actually produced the "found size 45 expected size was
-// 93" string-length error downstream: a reader expecting a Min float here
-// was instead handed the first bytes of the length-prefixed Name string,
-// and vice versa, so every field after the swap landed on the wrong byte
-// offsets. Name's wire type is `hashed_string`, but per the docs site
-// that type carries no extra on-wire fields beyond the usual
-// varuint32-length-prefixed string -- the "hashed" part is a client-side
-// runtime cache key derived FROM the string, not a separate byte on the
-// wire -- so writeString() here is already correct.
+// Writes a single Attribute entry. Field order confirmed directly
+// against gophertunnel's Attribute.Marshal (minecraft/protocol/attribute.go):
+// Min, Max, Value, DefaultMin, DefaultMax, Default, Name, Modifiers.
 void writeAttribute(vector<uint8_t>& packet, const string& name,
                      float min, float max, float current,
                      float defaultMin, float defaultMax, float defaultValue) {
@@ -37,53 +28,104 @@ void writeAttribute(vector<uint8_t>& packet, const string& name,
     writeVarInt(packet, 0); // Modifiers: array count = 0
 }
 
-} // namespace
-
-void sendUpdateAttributes(int sock, sockaddr_in clientAddr, ClientState& state,
-                           float health, float maxHealth) {
-    // Gamepacket header (varint) for UpdateAttributes.
-    //
-    // FIXED: this was 25 (0x19) — confirmed WRONG. Cross-checking
-    // PrismarineJS/minecraft-data's current bedrock proto.yml (the same
-    // schema that decoded this project's own real-client capture) shows
-    // 0x19 is explicitly `packet_level_event`, not update_attributes. That
-    // exactly explains a real symptom seen in testing: a phantom
-    // "level_event" packet with garbage/insane position values appearing
-    // right where UpdateAttributes gets sent — the client was decoding
-    // these bytes using LevelEvent's schema instead. The earlier "count
-    // packet IDs sequentially from IDLogin=1" approach used to arrive at
-    // 25 doesn't hold up: real packet IDs have gaps from removed packets
-    // (e.g. a slot at 0x10 and RiderJump at 0x14, both still reserved even
-    // though unused/removed) that a plain sequential count skips over.
-    // Counting gophertunnel's actual registration order against the
-    // schema's confirmed numeric IDs instead
-    // (0x19 level_event, 0x1a block_event, 0x1b entity_event,
-    // 0x1c mob_effect, 0x1d update_attributes) puts UpdateAttributes at
-    // 29 (0x1D).
+// Shared header + footer for every UpdateAttributes send: gamepacket ID,
+// Runtime Entity ID, the Attributes array (built by the caller), and the
+// trailing Tick field.
+void sendAttributes(int sock, sockaddr_in clientAddr, ClientState& state,
+                     const vector<function<void(vector<uint8_t>&)>>& attrWriters) {
     vector<uint8_t> packet;
-    writeVarInt(packet, 29);
+    writeVarInt(packet, 29); // UpdateAttributes
 
-    // Runtime Entity ID (varuint64) — this project has exactly one player
-    // per connection, fixed at 1 (see StartGamePacket.cpp).
-    writeVarInt64(packet, 1);
+    writeVarInt64(packet, 1); // Runtime Entity ID (this project's one player)
 
-    // Attributes: varint-prefixed array. Only minecraft:health is sent —
-    // this is a direct, minimal replacement for the old SetHealth call.
-    // Add further entries here (movement, hunger, etc.) the same way if
-    // this ever needs to cover more than health.
-    writeVarInt(packet, 1); // Attributes: array count = 1
-    writeAttribute(packet, "minecraft:health",
-                    /*min*/ 0.0f, /*max*/ maxHealth, /*current*/ health,
-                    /*defaultMin*/ 0.0f, /*defaultMax*/ maxHealth, /*defaultValue*/ maxHealth);
+    writeVarInt(packet, (uint32_t)attrWriters.size()); // Attributes: array count
+    for (auto& w : attrWriters) w(packet);
 
-    // FIXED: this packet has a 3rd top-level field per the official docs --
-    // Tick (PlayerInputTick, varuint64) -- that was missing entirely. A
-    // reader that trusts the schema will always try to read it, so leaving
-    // it off shortens the packet by (at least) one byte versus what the
-    // client expects. 0 is a safe placeholder; wire in the real current
-    // server tick here once this project is tracking one.
-    writeVarInt64(packet, 0); // Tick
+    writeVarInt64(packet, 0); // Tick -- placeholder until real tick tracking exists
 
     queueGamePacket(state, packet);
-    cout << "[Bedrock] Sent UpdateAttributes(health=" << health << "/" << maxHealth << ")\n";
+}
+
+} // namespace
+
+// Values copied directly from Dragonfly's Session.SendSpeed
+// (server/session/player.go): minecraft:movement, min 0, max
+// FLT_MAX, default 0.1.
+void sendUpdateAttributesSpeed(int sock, sockaddr_in clientAddr, ClientState& state,
+                                float speed) {
+    sendAttributes(sock, clientAddr, state, {
+        [&](vector<uint8_t>& p) {
+            writeAttribute(p, "minecraft:movement",
+                            0.0f, FLT_MAX, speed,
+                            0.0f, FLT_MAX, 0.1f);
+        }
+    });
+    cout << "[Bedrock] Sent UpdateAttributes(speed=" << speed << ")\n";
+}
+
+// Values copied directly from Dragonfly's Session.SendHealth: health
+// (min 0, max/default-max = maxHealth, default 20) + absorption
+// (min 0, max FLT_MAX, no default).
+void sendUpdateAttributesHealth(int sock, sockaddr_in clientAddr, ClientState& state,
+                                 float health, float maxHealth, float absorption) {
+    sendAttributes(sock, clientAddr, state, {
+        [&](vector<uint8_t>& p) {
+            writeAttribute(p, "minecraft:health",
+                            0.0f, maxHealth, health,
+                            0.0f, 20.0f, 20.0f);
+        },
+        [&](vector<uint8_t>& p) {
+            writeAttribute(p, "minecraft:absorption",
+                            0.0f, FLT_MAX, absorption,
+                            0.0f, FLT_MAX, 0.0f);
+        }
+    });
+    cout << "[Bedrock] Sent UpdateAttributes(health=" << health << "/" << maxHealth
+         << ", absorption=" << absorption << ")\n";
+}
+
+// Values copied directly from Dragonfly's Session.SendExperience:
+// minecraft:player.level (min 0, max INT32_MAX) + minecraft:player.experience
+// (progress, min 0, max 1).
+void sendUpdateAttributesExperience(int sock, sockaddr_in clientAddr, ClientState& state,
+                                     int32_t level, float progress) {
+    sendAttributes(sock, clientAddr, state, {
+        [&](vector<uint8_t>& p) {
+            writeAttribute(p, "minecraft:player.level",
+                            0.0f, (float)INT32_MAX, (float)level,
+                            0.0f, (float)INT32_MAX, 0.0f);
+        },
+        [&](vector<uint8_t>& p) {
+            writeAttribute(p, "minecraft:player.experience",
+                            0.0f, 1.0f, progress,
+                            0.0f, 1.0f, 0.0f);
+        }
+    });
+    cout << "[Bedrock] Sent UpdateAttributes(level=" << level << ", progress=" << progress << ")\n";
+}
+
+// Values copied directly from Dragonfly's Session.SendFood: hunger
+// (min 0, max/default-max/default 20) + saturation (same bounds) +
+// exhaustion (min 0, max/default-max 5, no default).
+void sendUpdateAttributesFood(int sock, sockaddr_in clientAddr, ClientState& state,
+                               int32_t food, float saturation, float exhaustion) {
+    sendAttributes(sock, clientAddr, state, {
+        [&](vector<uint8_t>& p) {
+            writeAttribute(p, "minecraft:player.hunger",
+                            0.0f, 20.0f, (float)food,
+                            0.0f, 20.0f, 20.0f);
+        },
+        [&](vector<uint8_t>& p) {
+            writeAttribute(p, "minecraft:player.saturation",
+                            0.0f, 20.0f, saturation,
+                            0.0f, 20.0f, 20.0f);
+        },
+        [&](vector<uint8_t>& p) {
+            writeAttribute(p, "minecraft:player.exhaustion",
+                            0.0f, 5.0f, exhaustion,
+                            0.0f, 5.0f, 0.0f);
+        }
+    });
+    cout << "[Bedrock] Sent UpdateAttributes(food=" << food << ", saturation=" << saturation
+         << ", exhaustion=" << exhaustion << ")\n";
 }

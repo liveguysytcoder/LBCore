@@ -15,6 +15,10 @@
 #include "../Packets/LevelChunkPacket.h"
 #include "../Packets/SubChunkPacket.h"
 #include "../Packets/GamePacketSender.h"
+#include "../Packets/PlayerAuthInputPacket.h"
+#include "../Packets/TickSyncPacket.h"
+#include "../Packets/Multiplayer.h"
+#include "../Packets/Chat.h"
 #include <sys/socket.h>
 #include <arpa/inet.h>
 
@@ -78,16 +82,21 @@ void handleGamePacket(int sock, sockaddr_in clientAddr, ClientState& state, cons
             // ChunkRadiusUpdated confirming the radius actually granted.
             //
             // Checked against gophertunnel's current RequestChunkRadius
-            // struct: it has TWO fields now, not one --
-            //   ChunkRadius    int32 // the radius the client wants
-            //   MaxChunkRadius int32 // the highest the client will accept
-            // Both are ZigZag varints, in that order. We weren't reading
-            // MaxChunkRadius at all before -- harmless here since each
-            // packet in a batch is parsed from its own byte range (see
-            // handleGamePacket's caller), so it didn't desync anything, but
-            // it left part of the packet's actual structure unread.
+            // struct directly (request_chunk_radius.go):
+            //   ChunkRadius    int32 // io.Varint32   -- SIGNED zigzag varint
+            //   MaxChunkRadius uint8 // io.Uint8      -- single raw byte
+            // FIXED: MaxChunkRadius was being read as a second ZigZag32
+            // varint, but the real field is a plain unsigned byte (Uint8),
+            // not a varint at all. That happened to not desync anything
+            // else in this packet (it's the last field), but it produced a
+            // wrong logged value and, more importantly, wasn't an "exact
+            // field" match -- readUByte is now used, matching the real
+            // wire type.
             int32_t requestedRadius = readZigZag32(data, offset);
-            int32_t maxRadius = readZigZag32(data, offset);
+            // MaxChunkRadius is only sent by newer clients; guard the read
+            // in case an older client's packet genuinely ends here.
+            int32_t maxRadius = requestedRadius;
+            if (offset < data.size()) maxRadius = readUByte(data, offset);
             cout << "[Bedrock] RequestChunkRadius: requested=" << requestedRadius
                  << " max=" << maxRadius << "\n";
 
@@ -111,7 +120,7 @@ void handleGamePacket(int sock, sockaddr_in clientAddr, ClientState& state, cons
             break;
         }
 
-        case 0xA2: { // SubChunkRequest -- kept as harmless dead code: a real
+        case 0xAF: { // SubChunkRequest (id 175; was wrongly 0xA2) -- kept as harmless dead code: a real
             // vanilla server capture confirmed LevelChunk delivers all
             // terrain inline (see LevelChunkPacket.cpp's header comment)
             // and a real client never actually sends this packet. Left in
@@ -121,9 +130,9 @@ void handleGamePacket(int sock, sockaddr_in clientAddr, ClientState& state, cons
             // Position (3x zigzag32), then a VarInt count of relative
             // (dx,dy,dz) signed-byte offsets.
             int32_t dimension = readZigZag32(data, offset);
-            int32_t baseX = readZigZag32(data, offset);
-            int32_t baseY = readZigZag32(data, offset);
-            int32_t baseZ = readZigZag32(data, offset);
+            int32_t baseX = readInt(data, offset); // SubChunkPos = 3 fixed int32 in 2193
+            int32_t baseY = readInt(data, offset);
+            int32_t baseZ = readInt(data, offset);
             uint32_t count = readVarInt(data, offset);
 
             vector<SubChunkOffsetRequest> offsets;
@@ -144,15 +153,120 @@ void handleGamePacket(int sock, sockaddr_in clientAddr, ClientState& state, cons
             break;
         }
 
-        case 0x71: // SetLocalPlayerAsInitialised
+        case 0x90: // PlayerAuthInput -- real clients send this continuously
+            // (many times/sec) once actually in the world. See
+            // PlayerAuthInputPacket.h/.cpp for the parsed field layout and
+            // why an MVP (front-block-only) parse is safe here.
+            handlePlayerAuthInput(sock, clientAddr, state, data, offset);
+            break;
+
+        case 0x17: // TickSync -- ADDED: previously completely unhandled,
+            // not even acknowledged. Real clients use this as a request/
+            // response timing handshake right around when they start
+            // sending PlayerAuthInput; total silence here is a real
+            // candidate for a real client concluding the connection is
+            // unhealthy shortly after spawning. See TickSyncPacket.h for
+            // the response strategy (echo, not a fabricated tick count).
+            handleTickSync(sock, clientAddr, state, data, offset);
+            break;
+
+        case 0x21: {
+            // Interact -- ADDED real parsing (was previously just logged
+            // and ignored with no field visibility at all). Fields
+            // confirmed against protocol.json's packet_interact for
+            // 1.26.40: action_id (mapper u8: leave_vehicle=3,
+            // mouse_over_entity=4, npc_open=5, open_inventory=6),
+            // target_entity_id (varint64), has_position (bool), position
+            // (vec3f, only if has_position). Safe to parse without risk
+            // of desyncing anything else in the batch -- see
+            // PlayerAuthInputPacket.h's comment for why (each packet in a
+            // batch is already sliced to its own declared length before
+            // this switch ever sees it).
+            //
+            // This is diagnostic-only for now: logs which action_id a
+            // real client actually sends right before it disconnected in
+            // an earlier test, so the next real-client test tells us
+            // definitively rather than guessing which of the 4 possible
+            // actions it was.
+            uint8_t actionId = readUByte(data, offset);
+            uint64_t targetEntityId = readVarInt64(data, offset);
+            bool hasPosition = readBool(data, offset);
+            float posX = 0, posY = 0, posZ = 0;
+            if (hasPosition) {
+                posX = readFloat(data, offset);
+                posY = readFloat(data, offset);
+                posZ = readFloat(data, offset);
+            }
+            const char* actionName = "unknown";
+            switch (actionId) {
+                case 3: actionName = "leave_vehicle";     break;
+                case 4: actionName = "mouse_over_entity";  break;
+                case 5: actionName = "npc_open";           break;
+                case 6: actionName = "open_inventory";     break;
+            }
+            cout << "[Bedrock] Interact: action_id=" << (int)actionId << " (" << actionName << ")"
+                 << " target_entity_id=" << targetEntityId
+                 << " has_position=" << (hasPosition ? "true" : "false");
+            if (hasPosition) {
+                cout << " position=(" << posX << ", " << posY << ", " << posZ << ")";
+            }
+            cout << " -- not acted on yet, parsed for diagnosis only\n";
+            break;
+        }
+
+        case 0x09: // Text -- inbound chat: validated, rate-limited, broadcast
+            handleText(sock, clientAddr, state, data, offset);
+            break;
+
+        case 0x4D: // CommandRequest -- built-in commands, replies with CommandOutput
+            handleCommandRequest(sock, clientAddr, state, data, offset);
+            break;
+
+        case 0x2C: // Animate -- arm swing, forwarded to the other players
+            handleAnimate(state, data, offset);
+            break;
+
+        case 0x98: // EmoteList -- the client's equipped emotes; nothing to do
+            break;
+
+        case 0x138: // ServerboundLoadingScreen -- marks when the client's
+            // loading screen starts/ends. No reply needed; useful later as
+            // a real "player has finished loading" signal instead of
+            // guessing from RequestChunkRadius alone.
+            cout << "[Bedrock] ServerboundLoadingScreen (not yet handled, ignoring)\n";
+            break;
+
+        case 0x71: { // SetLocalPlayerAsInitialised
             // Sent by the client in response to PlayStatus(PlayerSpawn) --
             // marks the point where the client is fully initialised and
-            // will stop discarding packets it wasn't expecting. This is
-            // purely informational (no reply needed), but worth logging
-            // instead of silently dropping like every other unhandled ID,
-            // since it's the real signal that spawning succeeded.
-            cout << "[Bedrock] SetLocalPlayerAsInitialised -- client has finished spawning\n";
+            // will stop discarding packets it wasn't expecting.
+            //
+            // FIELDS: confirmed directly against gophertunnel's
+            // set_local_player_as_initialised.go -- the packet carries
+            // exactly one field, EntityRuntimeID, written via
+            // io.ActorRuntimeID (an UNSIGNED varint64), the same encoding
+            // StartGame's own Runtime ID uses. This project always assigns
+            // runtime ID 1 to the single player on a connection (see
+            // StartGamePacket.cpp's writeVarInt64(packet, 1)), so this is
+            // the client echoing that same id back. Previously this field
+            // was never actually read -- the packet was only logged by ID.
+            // Reading it now and comparing against the id we handed out
+            // mirrors gophertunnel's own handleSetLocalPlayerAsInitialised,
+            // which treats a mismatch here as a protocol error worth
+            // surfacing rather than silently ignoring.
+            uint64_t initialisedRuntimeId = readVarInt64(data, offset);
+            constexpr uint64_t kExpectedRuntimeId = 1; // matches StartGame's Runtime ID
+            if (initialisedRuntimeId != kExpectedRuntimeId) {
+                cout << "[Bedrock] SetLocalPlayerAsInitialised: entity runtime ID mismatch "
+                        "(expected " << kExpectedRuntimeId << " from StartGame, got "
+                     << initialisedRuntimeId << ")\n";
+            } else {
+                cout << "[Bedrock] SetLocalPlayerAsInitialised(entityRuntimeId="
+                     << initialisedRuntimeId << ") -- client has finished spawning\n";
+            }
+            sendSpawnSequencePhase2(sock, clientAddr, state, "SetLocalPlayerAsInitialised");
             break;
+        }
 
         default:
             cout << "[Bedrock] Unknown packet ID: 0x"
@@ -262,6 +376,12 @@ void handleBedrockPacket(int sock, sockaddr_in clientAddr, ClientState& state, c
         vector<uint8_t> packetBytes(payload->begin() + offset, payload->begin() + offset + length);
         offset += length;
 
-        handleGamePacket(sock, clientAddr, state, packetBytes);
+        // A malformed/truncated packet must never crash the server: the read
+        // helpers now throw on over-reads and it is caught here, per packet.
+        try {
+            handleGamePacket(sock, clientAddr, state, packetBytes);
+        } catch (const std::exception& e) {
+            cout << "[Bedrock] Dropped malformed packet (" << e.what() << ")\n";
+        }
     }
 }

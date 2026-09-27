@@ -290,3 +290,61 @@ void destroyClientEncryption(ClientState& state) {
         state.recvCipherCtx = nullptr;
     }
 }
+
+// Verified against Minecraft Wiki's Bedrock Login Sequence documentation
+// page, which cites this exact base64 string as Mojang's constant root
+// public key (P-384 / secp384r1, X.509 SubjectPublicKeyInfo DER) used to
+// sign one link in a real Xbox Live-authenticated chain.
+const char* kMojangRootPublicKeyBase64 =
+    "MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAE8ELkixyLcwlZryUQcu1TvPOmI2B7vX83ndnW"
+    "RUaXm74wFfa5f/lwQNTfrLVHa2PmenpGI6JhIMUJaWZrjmMj90NoKNFSNBuKdm8rYiXs"
+    "faz3K36x/1U26HpG0ZxK/V1V";
+
+bool verifyES384Signature(const string& signingInput, const string& rawSignatureB64Url,
+                           const string& publicKeyBase64Der) {
+    vector<uint8_t> derKey = base64Decode(publicKeyBase64Der);
+    if (derKey.empty()) return false;
+
+    const unsigned char* p = derKey.data();
+    EVP_PKEY* pubKey = d2i_PUBKEY(nullptr, &p, static_cast<long>(derKey.size()));
+    if (!pubKey) {
+        logOpenSslError("verifyES384Signature (d2i_PUBKEY — malformed public key)");
+        return false;
+    }
+
+    vector<uint8_t> rawSig = base64UrlDecode(rawSignatureB64Url);
+    if (rawSig.size() != 96) { // 48 bytes r + 48 bytes s (P-384 field width)
+        EVP_PKEY_free(pubKey);
+        return false;
+    }
+
+    // Reverse of signES384(): rebuild the ASN.1 DER signature OpenSSL's
+    // verify functions expect from the raw JOSE (r||s) form the JWT carries.
+    BIGNUM* r = BN_bin2bn(rawSig.data(), 48, nullptr);
+    BIGNUM* s = BN_bin2bn(rawSig.data() + 48, 48, nullptr);
+    ECDSA_SIG* sig = ECDSA_SIG_new();
+    ECDSA_SIG_set0(sig, r, s); // sig takes ownership of r and s
+
+    unsigned char* derSig = nullptr;
+    int derSigLen = i2d_ECDSA_SIG(sig, &derSig);
+    ECDSA_SIG_free(sig);
+    if (derSigLen <= 0) {
+        logOpenSslError("verifyES384Signature (i2d_ECDSA_SIG)");
+        EVP_PKEY_free(pubKey);
+        return false;
+    }
+
+    EVP_MD_CTX* mdctx = EVP_MD_CTX_new();
+    bool ok = false;
+    if (EVP_DigestVerifyInit(mdctx, nullptr, EVP_sha384(), nullptr, pubKey) > 0 &&
+        EVP_DigestVerifyUpdate(mdctx, signingInput.data(), signingInput.size()) > 0) {
+        ok = (EVP_DigestVerifyFinal(mdctx, derSig, static_cast<size_t>(derSigLen)) == 1);
+    } else {
+        logOpenSslError("verifyES384Signature (DigestVerifyInit/Update)");
+    }
+
+    EVP_MD_CTX_free(mdctx);
+    OPENSSL_free(derSig);
+    EVP_PKEY_free(pubKey);
+    return ok;
+}

@@ -29,8 +29,14 @@ void decodeOpenConnectionRequestOne(int sock, sockaddr_in clientAddr, const vect
 
     unsigned char protocol = data[17];
 
-    //cout << "Protocol Version: " << (int)protocol << endl;
-    //cout << "RakNet Magic Valid: " << (magicOK ? "YES" : "NO") << endl;
+    // Diagnostic logging (was commented out): shows whether the client's
+    // magic matched (a mismatch means NO reply is sent) and which RakNet
+    // protocol version byte this client declares (real Bedrock uses 11).
+    cout << "[RakNet] OCR1 from " << inet_ntoa(clientAddr.sin_addr)
+         << ":" << ntohs(clientAddr.sin_port)
+         << " size=" << data.size()
+         << " raknetProtocol=" << (int)protocol
+         << " magic=" << (magicOK ? "OK" : "BAD -- NOT replying") << "\n";
 
     if (magicOK)
         sendOpenConnectionReplyOne(sock, clientAddr, protocol);

@@ -10,6 +10,12 @@ uint16_t nextClientIndex = 0;
 // Full per-connection RakNet state, keyed by "ip:port".
 map<string, ClientState> clientStates;
 
+void (*g_onClientRemoved)(ClientState&) = nullptr;
+
+void forEachClient(const function<void(ClientState&)>& fn) {
+    for (auto& kv : clientStates) fn(kv.second);
+}
+
 string getClientKey(sockaddr_in clientAddr) {
     char ip[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &clientAddr.sin_addr, ip, sizeof(ip));
@@ -25,6 +31,8 @@ ClientState& getOrCreateClient(sockaddr_in clientAddr) {
 
     ClientState state;
     state.index = nextClientIndex++;
+    state.addr = clientAddr;
+    state.entityId = 2 + state.index; // id other clients see (own view is always 1)
     auto result = clientStates.emplace(key, state);
     cout << "[Clients] New client " << key << " assigned index " << state.index << "\n";
     return result.first->second;
@@ -38,6 +46,7 @@ void removeClient(sockaddr_in clientAddr) {
     string key = getClientKey(clientAddr);
     auto it = clientStates.find(key);
     if (it != clientStates.end()) {
+        if (g_onClientRemoved && it->second.spawned) g_onClientRemoved(it->second);
         destroyClientEncryption(it->second); // frees sendCipherCtx/recvCipherCtx if set
         clientStates.erase(it);
     }

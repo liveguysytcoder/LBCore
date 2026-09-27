@@ -6,29 +6,34 @@
 
 using namespace std;
 
-// Sends UpdateAttributes (25 / 0x19 in the current protocol numbering —
-// verified against gophertunnel's packet ID constants: counting
-// IDLogin=1 through IDUpdateAttributes gives 25, NOT the 0x2A/42 this
-// project's old SetHealth packet used, which was copied from a much older
-// protocol doc (1.16.220 / protocol 431) where extra packets like
-// TickSync/RiderJump that have since been removed shifted every ID after
-// them).
+// Sends UpdateAttributes (29 / 0x1D — confirmed directly against
+// gophertunnel's own packet/id.go const block by counting its iota
+// sequence, including the two unnamed `_` reserved slots at 20 and
+// 23/24 that a naive sequential count would miss).
 //
-// This replaces sendSetHealth(): per the Bedrock protocol docs, SetHealth
-// "should no longer be used. Instead, the health attribute should be used
-// so that the health and maximum health may be changed directly."
+// FIELD LAYOUT CONFIRMED: gophertunnel's real Attribute.Marshal (in
+// minecraft/protocol/attribute.go) was read directly this session —
+// Min, Max, Value(Current), DefaultMin, DefaultMax, Default, Name,
+// Modifiers — which matches exactly what this project already had.
+// The earlier uncertainty note (this file used to say the order
+// couldn't be pulled from source) is resolved: no change needed there.
 //
-// NOTE ON FIELD LAYOUT: gophertunnel's protocol.Attribute struct is
-// confirmed (via pkg.go.dev) to contain Name/Value/Max/Min (embedded
-// AttributeValue) plus DefaultMin/DefaultMax/Default and a Modifiers
-// slice — but the exact *wire order* Marshal() writes those fields in
-// couldn't be pulled from source directly (GitHub blocked raw/robots
-// access during this session). The layout below follows the order that
-// has stayed consistent across every documented Bedrock protocol version
-// (Min, Max, Current, [DefaultMin, DefaultMax, Default], Name, Modifiers)
-// and matches the struct's field grouping, but — like the VoxelShapes
-// packet flagged earlier in this codebase — treat this as needing a
-// byte-level diff against a real client capture before relying on it,
-// rather than as separately re-verified.
-void sendUpdateAttributes(int sock, sockaddr_in clientAddr, ClientState& state,
-                           float health, float maxHealth);
+// SPLIT INTO 4 FUNCTIONS: a real Dragonfly capture showed
+// UpdateAttributes sent 4 times during spawn, with PlayerList
+// interleaved after the first. Reading Dragonfly's own
+// server/session/player.go confirms why: these are 4 DIFFERENT calls
+// (SendSpeed, then later SendHealth/SendExperience/SendFood from
+// Session.Spawn(), in that exact order), not the same health packet
+// repeated. Values, mins/maxes and defaults below are copied directly
+// from those functions.
+void sendUpdateAttributesSpeed(int sock, sockaddr_in clientAddr, ClientState& state,
+                                float speed);
+
+void sendUpdateAttributesHealth(int sock, sockaddr_in clientAddr, ClientState& state,
+                                 float health, float maxHealth, float absorption);
+
+void sendUpdateAttributesExperience(int sock, sockaddr_in clientAddr, ClientState& state,
+                                     int32_t level, float progress);
+
+void sendUpdateAttributesFood(int sock, sockaddr_in clientAddr, ClientState& state,
+                               int32_t food, float saturation, float exhaustion);

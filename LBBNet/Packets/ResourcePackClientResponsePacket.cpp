@@ -1,8 +1,11 @@
 #include "ResourcePackClientResponsePacket.h"
+#include "Multiplayer.h"
 #include "DataTypeHelper.h"
 #include "GamePacketSender.h"
 #include "ResourcePackStackPacket.h"
 #include "StartGamePacket.h"
+#include "JigsawStructureDataPacket.h"
+#include "VoxelShapesPacket.h"
 #include "LevelChunkPacket.h"
 #include "NetworkChunkPublisherUpdatePacket.h"
 #include "PlayStatusPacket.h"
@@ -13,6 +16,7 @@
 #include "CraftingDataPacket.h"
 #include "SetSpawnPositionPacket.h"
 #include "UpdateAttributesPacket.h"
+#include "PlayerListPacket.h"
 #include "TrimDataPacket.h"
 #include "SetTimePacket.h"
 #include "GameRulesChangedPacket.h"
@@ -23,6 +27,7 @@
 #include "SetEntityDataPacket.h"
 #include "TextPacket.h"
 #include "AvailableCommandsPacket.h"
+#include "ItemRegistryPacket.h"
 #include <iostream>
 
 using namespace std;
@@ -111,6 +116,19 @@ void completeResourcePackStageAndStartGame(int sock, sockaddr_in clientAddr, Cli
     // in the real sequence, not before it — an earlier pass of this file
     // had all of that here, which was wrong. See sendSpawnSequence() below
     // for the corrected, capture-verified order.
+    // A real Dragonfly capture (packet-logger_log.txt) showed two empty
+    // packets sent right before StartGame that this project was previously
+    // missing entirely: JigsawStructureData then VoxelShapes, in that
+    // order. An earlier pass here incorrectly believed VoxelShapes wasn't
+    // a real packet and removed it -- the Dragonfly capture disproves
+    // that; both are real, currently-used packet IDs (313 and 337) that a
+    // working server sends at exactly this point in the handshake.
+    cout << "[StartGame] Sending JigsawStructureData (empty)\n";
+    sendJigsawStructureData(sock, clientAddr, state);
+
+    cout << "[StartGame] Sending VoxelShapes (empty)\n";
+    sendVoxelShapes(sock, clientAddr, state);
+
     cout << "[StartGame] Sending StartGame\n";
     sendStartGame(sock, clientAddr, state);
 }
@@ -154,21 +172,113 @@ void sendSpawnSequence(int sock, sockaddr_in clientAddr, ClientState& state) {
     }
     state.spawnSequenceSent = true;
 
-    sendEmptyBiomeDefinitionList(sock, clientAddr, state);
+    // NOTE: no longer sending an empty BiomeDefinitionList here. A real
+    // Dragonfly capture against a modern (1.26.40) client via
+    // bedrock-protocol shows it going straight from ChunkRadiusUpdated to
+    // PlayStatus(PlayerSpawn) -- NO empty BiomeDefinitionList in between at
+    // all. That empty packet exists purely for pre-1.21.80 client
+    // compatibility (their achievement system assumes all biomes are
+    // present); Dragonfly is version-aware enough to skip it for anything
+    // newer, which this project wasn't. This project's target (1.26.45) is
+    // well past that cutoff, so sending it unconditionally was itself the
+    // deviation from a real server, not the fix.
     sendPlayStatus(sock, clientAddr, state, PlayStatusType::PlayerSpawn);
-    sendCreativeContent(sock, clientAddr, state);
+    sendCreativeContent(sock, clientAddr, state); // EMPTY here -- matches gophertunnel's handshake default exactly
+    // -- Phase 1 ends here. -----------------------------------------------
+    // The working reference (gophertunnel/Dragonfly) sends nothing but
+    // PlayerSpawn and CreativeContent at this point and then WAITS for the
+    // client's SetLocalPlayerAsInitialised before sending anything else
+    // (Dragonfly's StartGame blocks on it). This server used to send ~40
+    // more packets straight away, including a second full 1,934-item
+    // ItemRegistry (the reference's second registry carries only custom
+    // items, i.e. is empty), and the real client never sent
+    // SetLocalPlayerAsInitialised -- it aborted somewhere inside that burst.
+    // Splitting the sequence like the reference makes the failure point
+    // observable and removes the duplicates: the second ItemRegistry and
+    // second CreativeContent are no longer sent.
+    cout << "[Spawn] Phase 1 sent (PlayerSpawn + CreativeContent); holding the rest until "
+            "SetLocalPlayerAsInitialised (or the first PlayerAuthInput)\n";
+    flushGamePackets(sock, clientAddr, state);
+}
 
-    sendBiomeDefinitionList(sock, clientAddr, state); // the REAL 87-entry one now
-    sendCraftingData(sock, clientAddr, state);
-    sendEmptyTrimData(sock, clientAddr, state);
-    sendUpdateAttributes(sock, clientAddr, state, 20.0f, 20.0f);
-    sendSetTime(sock, clientAddr, state, 1);
-    sendGameRulesChanged(sock, clientAddr, state, "dodaylightcycle", /*editable=*/false, /*value=*/true);
-    sendLevelEvent(sock, clientAddr, state, LevelEventType::StopRain, 0, 0, 0, 0);
-    sendLevelEvent(sock, clientAddr, state, LevelEventType::StopThunder, 0, 0, 0, 0);
+void sendSpawnSequencePhase2(int sock, sockaddr_in clientAddr, ClientState& state, const char* trigger) {
+    if (state.spawnPhase2Sent) return;
+    state.spawnPhase2Sent = true;
 
-    // StartGame's spawn position is (0, 4, 0) — chunk (0, 0).
-    sendSetSpawnPosition(sock, clientAddr, state, SpawnPositionType::WorldSpawn, 0, 4, 0, 0);
+    // INTENTIONALLY DISABLED, for a deliberate isolation test.
+    //
+    // CORRECTION to earlier reasoning: I previously said SetLocalPlayerAsInitialised
+    // requires the client to have terrain first. That was wrong, and this
+    // project's own real gophertunnel source PROVES it's wrong: in
+    // minecraft/conn.go, `conn.StartGame()`/`StartGameContext()` blocks
+    // until it receives SetLocalPlayerAsInitialised FROM the client, and
+    // only returns after that. Dragonfly's own chunk-sending code
+    // (session.New() and Session.Spawn(), in server/session/session.go)
+    // is only ever called AFTER conn.StartGameContext() returns --
+    // meaning a real Dragonfly server sends ZERO chunks, ZERO inventory,
+    // and ZERO biome/creative/crafting data before the client sends this
+    // packet. Real Bedrock clients connecting to real Dragonfly servers
+    // still send it anyway, every time. So a real client does NOT need
+    // terrain to send SetLocalPlayerAsInitialised -- whatever it's
+    // actually waiting on must be fully contained in the handshake
+    // packets themselves (StartGame, ItemRegistry, ChunkRadiusUpdated,
+    // PlayStatus, CreativeContent(empty)).
+    //
+    // So: this is a genuine, valid isolation test, not a broken one. If
+    // this build still never receives SetLocalPlayerAsInitialised, the
+    // bug is somewhere in those 7 handshake packets themselves -- not
+    // "missing world data" (there isn't supposed to be any yet).
+    cout << "[Spawn] Reached SetLocalPlayerAsInitialised, released by: " << trigger
+         << ". Phase 2 is OFF for this test -- only the confirmed StartGame -> "
+            "SetLocalPlayerAsInitialised handshake packets were sent before this point.\n";
+    return;
+
+    // Everything below is ordered and sourced directly against Dragonfly's
+    // real Go source (server/server.go's finaliseConn, then
+    // server/session/session.go's Config.New() and Session.Spawn()),
+    // rather than a capture, so this section can be diffed against those
+    // functions again in the future.
+
+    // server.go: finaliseConn(), immediately after conn.StartGameContext()
+    // returns (i.e. right after SetLocalPlayerAsInitialised is handled) --
+    // a second ItemRegistry, empty (custom items only).
+    sendEmptyItemRegistry(sock, clientAddr, state);
+
+    // session.go: Config.New() -- session/world setup, in this exact order.
+    sendBiomeDefinitionList(sock, clientAddr, state);   // sendBiomes() -- the REAL 87-entry one
+    sendCreativeContentWithItems(sock, clientAddr, state); // CreativeContent, 2nd time, REAL items now
+    sendCraftingData(sock, clientAddr, state);          // sendRecipes()
+    sendEmptyTrimData(sock, clientAddr, state);         // sendArmourTrimData()
+    sendUpdateAttributesSpeed(sock, clientAddr, state, 0.1f); // SendSpeed(0.1)
+
+    // PlayerList(add) -- not part of Config.New()/Spawn() in the source
+    // directly (that's a multiplayer broadcast mechanism elsewhere), but
+    // kept here: a real Dragonfly capture showed a working server sending
+    // it at this exact point, and it's needed for the client to resolve
+    // its own skin/identity.
+    sendPlayerListAdd(sock, clientAddr, state);
+
+    // session.go: Spawn() -- in this exact order: SendHealth, then
+    // SendExperience, then SendFood (3 DIFFERENT UpdateAttributes calls,
+    // not repeats).
+    sendUpdateAttributesHealth(sock, clientAddr, state, /*health*/20.0f, /*maxHealth*/20.0f, /*absorption*/0.0f);
+    sendUpdateAttributesExperience(sock, clientAddr, state, /*level*/0, /*progress*/0.0f);
+    sendUpdateAttributesFood(sock, clientAddr, state, /*food*/20, /*saturation*/0.0f, /*exhaustion*/0.0f);
+
+    // REMOVED from here: SetTime, GameRulesChanged, LevelEvent(StopRain/
+    // StopThunder), SetSpawnPosition, UpdatePlayerGameType. Checked
+    // directly against dragonfly's source (grepped every writePacket call
+    // in server/session/*.go): none of these are sent as part of the join
+    // sequence at all. SetTime and UpdatePlayerGameType live in world.go
+    // as separate runtime-triggered functions (called later, when time or
+    // gamemode actually change); GameRulesChanged is a player.go function
+    // for runtime rule changes, not join; SetSpawnPosition
+    // (SendPlayerSpawn) is only sent when a spawn point is actually set
+    // (e.g. sleeping in a bed). Gamerule *defaults* ride inside StartGame
+    // itself (its own Rule Data field), which this project already sends
+    // separately. None of these were wrong to have tried, but they aren't
+    // what a real Dragonfly server sends here.
+
     // FIXED: this was 64 (blocks) = a 4-chunk radius, but the chunk-send
     // loop below only ever sends a 3x3 grid (1-chunk radius = 16 blocks)
     // around spawn. NetworkChunkPublisherUpdate is the server telling the
@@ -185,30 +295,31 @@ void sendSpawnSequence(int sock, sockaddr_in clientAddr, ClientState& state) {
     // again. If the chunk-send loop below is ever widened to cover more
     // area, bump kSentChunkRadius and this stays in sync automatically.
     sendNetworkChunkPublisherUpdate(sock, clientAddr, state, 0, 4, 0, kSentChunkRadius * 16);
-    sendAvailableActorIdentifiers(sock, clientAddr, state);
+    sendAvailableActorIdentifiers(sock, clientAddr, state); // sendAvailableEntities()
 
+    // session.go: SetGameMode() -- confirmed to call these two together,
+    // in exactly this order (SetPlayerGameType, then UpdateAbilities via
+    // SendAbilities). UpdatePlayerGameType is NOT part of this (see above).
     sendSetPlayerGameType(sock, clientAddr, state, 1); // creative, matches StartGame's player_gamemode
-    sendUpdatePlayerGameType(sock, clientAddr, state, /*gamemode=*/1, /*playerUniqueId=*/1, /*tick=*/0);
-
-    // FIXED: these two were fully written (see their own .cpp/.h files
-    // and header comments for what's confirmed vs. best-effort about each)
-    // but never actually called from here -- the real spawn burst was
-    // silently missing both. UpdateAbilities in particular is a very
-    // commonly-reported cause of a real client hanging on the loading
-    // screen forever in homebrew Bedrock server implementations: without
-    // it, the client has no idea what the player is allowed to do and
-    // apparently won't finish considering itself "spawned". Matches the
-    // real capture's order too (#29 UpdateAbilities, #31 SetEntityData,
-    // both between UpdatePlayerGameType/#30 and InventoryContent/#32).
     sendUpdateAbilities(sock, clientAddr, state);
-    sendSetEntityData(sock, clientAddr, state);
 
-    // The client builds its inventory/hotbar HUD right as it spawns in.
+    // MobEffect would go here (once per active effect) -- skipped, this
+    // project has no effects system yet, so there's nothing to send.
+
+    sendSetEntityData(sock, clientAddr, state); // ViewEntityState()
+
+    // sendInv() x4, in exactly this order (inventory, ui, offhand, armour).
     sendInventoryContent(sock, clientAddr, state, InventoryWindowId::Inventory);
-    sendInventoryContent(sock, clientAddr, state, InventoryWindowId::Armor);
+    sendInventoryContent(sock, clientAddr, state, InventoryWindowId::UI);
     sendInventoryContent(sock, clientAddr, state, InventoryWindowId::OffHand);
+    sendInventoryContent(sock, clientAddr, state, InventoryWindowId::Armor);
 
-    sendJoinMessage(sock, clientAddr, state, state.displayName);
+    sendJoinMessage(sock, clientAddr, state, state.displayName); // the join chat message
+    // AvailableCommands: kept, even though it's not sent at this exact
+    // point in the source (it's driven by a background/command-registry
+    // mechanism elsewhere) -- sending an empty one here is harmless and
+    // means a client asking for commands gets a well-formed (if empty)
+    // answer instead of nothing.
     sendAvailableCommands(sock, clientAddr, state);
 
     // Chunk streaming itself starts here too in the real capture (#39),
@@ -218,33 +329,40 @@ void sendSpawnSequence(int sock, sockaddr_in clientAddr, ClientState& state) {
     // NetworkChunkPublisherUpdate were clamped to above -- widen that one
     // constant to send more than a 3x3 patch, don't just change the loop
     // bounds here in isolation (that's what caused the mismatch bug).
+    //
+    // ADDED: a second SetEntityData right after the FIRST chunk only --
+    // the real capture shows exactly one extra send at that specific
+    // point (immediately after the first level_chunk, not after every
+    // chunk), so this fires once, guarded by a local flag, rather than
+    // once per chunk in the loop below.
+    bool firstChunkSent = false;
     for (int32_t cx = -kSentChunkRadius; cx <= kSentChunkRadius; cx++) {
         for (int32_t cz = -kSentChunkRadius; cz <= kSentChunkRadius; cz++) {
             sendLevelChunk(sock, clientAddr, state, cx, cz);
+            if (!firstChunkSent) {
+                firstChunkSent = true;
+                sendSetEntityData(sock, clientAddr, state);
+            }
         }
     }
 
     // Deliberately NOT sent — each was present in the real capture but
-    // skipped here, either because it's a low-value exact duplicate of
-    // something already sent, or because its wire format carries enough
-    // risk/complexity that sending it wrong seemed worse than not sending
-    // it at all (none of these look load-bearing for spawning/rendering):
-    //   - A second, empty ItemRegistry (#11) and a second, REAL,
-    //     populated CreativeContent (#13) — sending a populated
-    //     CreativeContent that references real item network IDs would be
-    //     actively inconsistent with this project's own ItemRegistry,
-    //     which defines zero items; better to stay consistent and empty.
-    //   - UpdateAbilities (#29) and SetEntityData (#31) — NO LONGER
-    //     skipped, now sent (see UpdateAbilitiesPacket.cpp /
-    //     SetEntityDataPacket.cpp for what's confirmed vs. best-effort
-    //     about each).
+    // skipped here, because its wire format carries enough risk/
+    // complexity that sending it wrong seemed worse than not sending it
+    // at all (neither looks load-bearing for spawning/rendering; the
+    // rest of the once-skipped duplicates -- the second ItemRegistry,
+    // second CreativeContent, the 3 extra UpdateAttributes, and the extra
+    // SetEntityData after the first chunk -- are NO LONGER skipped, see
+    // above):
     //   - PlayerList (#17) — carries full skin/geometry data per entry in
     //     the real capture (5MB+ for one player); tab-list UI only, not
     //     needed to render the world.
-    //   - 3 duplicate UpdateAttributes (#18-20), a duplicate
-    //     NetworkChunkPublisherUpdate (#38), and a 4th InventoryContent
-    //     window (#32-35 shows 4, this sends 3) — all appear to be
-    //     inconsequential repeats/extras in the capture.
+    //   - A duplicate NetworkChunkPublisherUpdate (#38) — an
+    //     inconsequential repeat in the capture (InventoryContent already
+    //     sends all 4 windows above — inventory, ui, offhand, armor — so
+    //     there's nothing missing there).
+
+    announcePlayerJoined(state); // multiplayer: introduce this player to others (and vice versa)
 
     flushGamePackets(sock, clientAddr, state);
 }

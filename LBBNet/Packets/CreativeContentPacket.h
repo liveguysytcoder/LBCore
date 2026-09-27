@@ -5,8 +5,14 @@
 
 using namespace std;
 
-// Sends CreativeContent (145 / 0x91) to the client — the contents of the
-// Creative inventory/recipe book. This project defines no creative groups
-// or item entries yet, so both lists are sent empty (an empty Creative
-// tab, rather than omitting the packet — a real client still expects it).
+// Sends CreativeContent (145 / 0x91), EMPTY -- this is what gophertunnel
+// actually sends automatically during the StartGame handshake (see
+// minecraft/conn.go: `&packet.CreativeContent{}`), before the client has
+// even sent SetLocalPlayerAsInitialised.
 void sendCreativeContent(int sock, sockaddr_in clientAddr, ClientState& state);
+
+// Sends CreativeContent again, this time with the real 41-item starter
+// list. Confirmed against Dragonfly's own session.New() to belong AFTER
+// SetLocalPlayerAsInitialised, during session/world setup -- called from
+// sendSpawnSequencePhase2().
+void sendCreativeContentWithItems(int sock, sockaddr_in clientAddr, ClientState& state);

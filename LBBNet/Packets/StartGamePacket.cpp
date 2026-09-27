@@ -103,7 +103,7 @@ void sendStartGame(int sock, sockaddr_in clientAddr, ClientState& state) {
         writeZigZag32(packet, static_cast<int32_t>(GeneratorType::Overworld)); // 2: Generator Type
         writeZigZag32(packet, static_cast<int32_t>(GameType::Survival));      // 3: Game Type
         writeBool(packet, false);                                             // 4: Is Hardcore
-        writeZigZag32(packet, static_cast<int32_t>(LevelDifficulty::Easy));   // 5: Game Difficulty
+        writeZigZag32(packet, 2);   // 5: Game Difficulty (2 = Normal, as the gophertunnel/Dragonfly reference sends)
 
         // 6: Default Spawn Block Position — RE-CONFIRMED by fetching the
         // complete, current start_game.go directly (raw source, not a
@@ -117,14 +117,14 @@ void sendStartGame(int sock, sockaddr_in clientAddr, ClientState& state) {
         writeZigZag32(packet, 4);
         writeZigZag32(packet, 0);
 
-        writeBool(packet, false); // 7: Achievements Disabled
+        writeBool(packet, true);  // 7: Achievements Disabled (reference sends true)
         writeZigZag32(packet, static_cast<int32_t>(EditorWorldType::NonEditor)); // 8: Editor World Type
         writeBool(packet, false); // 9: Is Created In Editor
         writeBool(packet, false); // 10: Is Exported From Editor
         writeZigZag32(packet, 0); // 11: Day Cycle Stop Time (disabled — 0)
 
         writeVarInt(packet, static_cast<uint32_t>(EducationEditionOffer::None)); // 12: Education Edition Offer
-        writeBool(packet, false);  // 13: Education Features Enabled
+        writeBool(packet, true);   // 13: Education Features Enabled (reference sends true)
         writeString(packet, "");   // 14: Education Product ID
 
         writeFloat(packet, 0.0f); // 15: Rain Level
@@ -132,7 +132,7 @@ void sendStartGame(int sock, sockaddr_in clientAddr, ClientState& state) {
 
         writeBool(packet, false); // 17: Has Confirmed Platform Locked Content
         writeBool(packet, true);  // 18: Multiplayer Game Intent
-        writeBool(packet, false); // 19: LAN Broadcast Intent
+        writeBool(packet, true);  // 19: LAN Broadcast Intent (reference sends true)
 
         writeVarInt(packet, static_cast<uint32_t>(BroadcastSetting::Public)); // 20: Xbox Live Broadcast Setting -- plain varint per the real protocol.json (protocol 2168), NOT zigzag32. Confirmed directly against the schema this time, not gophertunnel's Go source.
         writeVarInt(packet, static_cast<uint32_t>(BroadcastSetting::Public)); // 21: Platform Broadcast Setting -- same correction
@@ -174,8 +174,8 @@ void sendStartGame(int sock, sockaddr_in clientAddr, ClientState& state) {
         writeBool(packet, false); // 38: Custom Skins Disabled
         writeBool(packet, false); // 39: Emote Chat Muted
 
-        writeString(packet, "1.26.44"); // 40: Base Game Version — must match the
-                                     // client's actual build (protocol 2168)
+        writeString(packet, "1.26.51"); // 40: Base Game Version — must match the
+                                     // client's actual build (protocol 2193)
                                      // and agree with ResourcePacksStack's copy
 
         writeInt(packet, 0); // 41: Limited World Width (fixed LE int32)
@@ -220,7 +220,7 @@ void sendStartGame(int sock, sockaddr_in clientAddr, ClientState& state) {
 
     // 10: Movement Settings (SyncedPlayerMovementSettings)
     writeZigZag32(packet, 0);         // Rewind History Size (0 = client-authoritative, no server rewind)
-    writeBool(packet, false);         // Server Authoritative Block Breaking
+    writeBool(packet, true);          // Server Authoritative Block Breaking (reference: true)
 
     writeUInt64(packet, 0);           // 11: Level Current Time
     writeZigZag32(packet, 0);         // 12: Enchantment Seed
@@ -228,14 +228,19 @@ void sendStartGame(int sock, sockaddr_in clientAddr, ClientState& state) {
     writeVarInt(packet, 0);           // 13: Block Properties: array count = 0 (no custom blocks)
 
     writeString(packet, "00000000-0000-0000-0000-000000000000"); // 14: Multiplayer Correlation Id
-    writeBool(packet, false);         // 15: Enable Item Stack Net Manager
+    // 15: Enable Item Stack Net Manager == "server authoritative inventory".
+    // The working reference (Dragonfly) sends TRUE. This server used to send
+    // false while also sending modern full-size inventory windows, i.e. it
+    // told the client to use the legacy inventory system. Aligned with the
+    // reference; nothing in this server depends on the legacy behaviour.
+    writeBool(packet, true);
     // 16: GameVersion — this is a real version-compatibility field a
     // client can validate against its own build, not a free-text server
     // name. Was sending the literal string "LBBNet" here, which doesn't
     // parse as a version at all. Matched to BaseGameVersion (field 40,
-    // "1.26.44") and to the protocol=2168 this project's own log confirms
+    // "1.26.51") and to the protocol=2193 this project's own log confirms
     // the connecting client actually declares in RequestNetworkSettings.
-    writeString(packet, "1.26.44"); // 16: Game Version
+    writeString(packet, "1.26.51"); // 16: Game Version
 
     writeEmptyNbtCompound(packet);    // 17: Player Property Data (empty NBT compound — see helper above)
 

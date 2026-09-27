@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include <functional>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 
@@ -96,6 +97,33 @@ struct ClientState {
     string xuid;
     string identityUUID;
 
+    // Skin/appearance data extracted from the Login packet's client-data
+    // JWT (see extractClientSkinData() in LBBNet/Packets/LoginPacket.h/.cpp).
+    // Kept as flat primitive fields here (mirroring displayName/xuid/
+    // identityUUID above) rather than a LBBNet-layer struct, so this
+    // RakNet-layer header doesn't have to depend on the game-layer one.
+    // hasSkinData stays false (and every field below stays at its
+    // placeholder default) for connections that sent no usable clientData
+    // -- PlayerListPacket.cpp falls back to a baked default skin in that
+    // case rather than sending an empty/invalid one.
+    bool hasSkinData = false;
+    string skinId;
+    string skinResourcePatch;       // decoded JSON text
+    int32_t skinImageWidth = 0;
+    int32_t skinImageHeight = 0;
+    vector<uint8_t> skinImageData;  // decoded raw RGBA bytes
+    string capeId;
+    int32_t capeImageWidth = 0;
+    int32_t capeImageHeight = 0;
+    vector<uint8_t> capeImageData;  // decoded raw RGBA bytes; empty if no cape
+    string skinGeometryData;        // decoded JSON text
+    string skinGeometryDataVersion;
+    string skinAnimationData;       // decoded JSON text
+    string armSize = "wide";        // "wide" or "slim"
+    bool personaSkin = false;
+    bool premiumSkin = false;
+    bool capeOnClassicSkin = false;
+
     // Whether the client asked to use the blob-cache system (ClientCacheStatus,
     // gamepacket id 0x81 / 129 -- sent right after the resource pack stack,
     // per gophertunnel's conn.go: `conn.expect(IDResourcePackClientResponse,
@@ -122,6 +150,10 @@ struct ClientState {
     // sendSpawnSequence() in ResourcePackClientResponsePacket.h/.cpp and its
     // call site in PacketHandler.cpp's RequestChunkRadius (0x45) case.
     bool spawnSequenceSent = false;
+    // Two-phase spawn: phase 1 (PlayerSpawn + CreativeContent) is sent on
+    // RequestChunkRadius; phase 2 (everything else) waits for the client's
+    // SetLocalPlayerAsInitialised. See sendSpawnSequencePhase2().
+    bool spawnPhase2Sent = false;
 
     // Login encryption handshake state (see LBBNet/Packets/Encryption.h and
     // HandshakePacket.h/.cpp). Only turned on for clients that logged in
@@ -138,6 +170,42 @@ struct ClientState {
     // and all the crypto logic that touches these.
     void* sendCipherCtx = nullptr; // outgoing (encrypt)
     void* recvCipherCtx = nullptr; // incoming (decrypt)
+
+    // Live position/rotation, updated from PlayerAuthInput (gamepacket id
+    // 144 / 0x90) -- see LBBNet/Packets/PlayerAuthInputPacket.h/.cpp. Real
+    // clients send this continuously (many times/sec) once actually in the
+    // world, so these fields reflect wherever the player currently is/is
+    // looking, not just their StartGame spawn position.
+    float posX = 0.0f, posY = 0.0f, posZ = 0.0f;
+    float yaw = 0.0f, pitch = 0.0f, headYaw = 0.0f;
+    uint64_t lastAuthInputTick = 0;
+    bool receivedAuthInput = false; // true once the first PlayerAuthInput has arrived
+    // Tick this client's NetworkChunkPublisherUpdate was last (re-)sent.
+    // Real servers don't send this once and leave it -- see the note in
+    // streamChunksAround() in Multiplayer.cpp.
+    uint64_t lastPublisherUpdateTick = 0;
+
+    // ---- multiplayer / chunk-streaming state (added for 26.51 update) ----
+    // This client's UDP address, stored so the server can send to it from
+    // code running on behalf of a DIFFERENT client (chat, other players).
+    sockaddr_in addr{};
+    // The id every OTHER client uses for this player (AddPlayer/MovePlayer/
+    // RemoveActor). A player's own view of itself is always id 1 (StartGame).
+    int64_t entityId = 0;
+    // True once the full spawn sequence has gone out (safe to send game
+    // packets to this client from other clients' handlers).
+    bool spawned = false;
+    // Chunk the player was last streamed around + chunks the client holds.
+    int32_t lastChunkX = 0, lastChunkZ = 0;
+    set<pair<int32_t, int32_t>> sentChunks;
+    // PlayerAuthInput extras.
+    uint32_t authInputCount = 0;
+    uint64_t inputFlagMask = 0;
+    uint32_t inputMode = 0, playMode = 0;
+    float deltaX = 0.0f, deltaY = 0.0f, deltaZ = 0.0f;
+    // Chat flood guard (see Chat.cpp).
+    int64_t chatWindowStartMs = 0;
+    uint32_t chatWindowCount = 0;
 };
 
 string getClientKey(sockaddr_in clientAddr);
@@ -152,3 +220,10 @@ uint16_t addClient(sockaddr_in clientAddr);
 void removeClient(sockaddr_in clientAddr);
 bool isClientConnected(sockaddr_in clientAddr);
 ClientState* findExistingClient(sockaddr_in clientAddr);
+
+// Calls fn for every connected client (used for broadcasts).
+void forEachClient(const function<void(ClientState&)>& fn);
+
+// Optional hook invoked from removeClient() just before a client's state is
+// destroyed (set by Multiplayer.cpp to announce the departure to others).
+extern void (*g_onClientRemoved)(ClientState&);

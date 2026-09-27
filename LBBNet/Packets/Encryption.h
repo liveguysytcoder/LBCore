@@ -62,3 +62,26 @@ bool decryptGamePacket(ClientState& state, vector<uint8_t>& data);
 // Frees state's AES cipher contexts. Call when a client disconnects
 // (see LBNet/Server/Clients.cpp's removeClient) to avoid leaking them.
 void destroyClientEncryption(ClientState& state);
+
+// --- Xbox Live chain verification ---
+//
+// Mojang's known root public key (base64 X.509 SubjectPublicKeyInfo DER,
+// P-384). It appears as the "identityPublicKey" of whichever link in a
+// real Xbox Live-authenticated chain Mojang itself signed. This value is
+// constant and widely published (e.g. gophertunnel's minecraft/protocol/
+// login/jwt package, and multiple other open-source Bedrock server
+// projects cite the identical string) -- verified against Minecraft
+// Wiki's own login-sequence documentation page.
+extern const char* kMojangRootPublicKeyBase64;
+
+// Verifies one JWT's ES384 signature against `publicKeyBase64Der` (base64
+// X.509 SubjectPublicKeyInfo DER -- the same format as
+// getServerPublicKeyBase64()'s output and the chain's own
+// "identityPublicKey" claims). `signingInput` is the JWT with its
+// signature segment removed ("<base64url header>.<base64url payload>");
+// `rawSignatureB64Url` is the JWT's third (signature) segment, still
+// base64url-encoded exactly as the token carried it. Converts the raw
+// JOSE (r||s) signature back to ASN.1 DER internally -- the reverse of
+// what signES384() (used for our own outgoing handshake JWT) does.
+bool verifyES384Signature(const string& signingInput, const string& rawSignatureB64Url,
+                           const string& publicKeyBase64Der);

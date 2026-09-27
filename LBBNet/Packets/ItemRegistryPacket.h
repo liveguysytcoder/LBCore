@@ -11,3 +11,10 @@ using namespace std;
 // required_item_list.json. Real clients crash shortly after spawning in
 // without this; an empty list is not sufficient.
 void sendItemRegistry(int sock, sockaddr_in clientAddr, ClientState& state);
+
+// Sends ItemRegistry a SECOND time, empty. CONFIRMED against Dragonfly's
+// own source (server/server.go, right after conn.StartGameContext(...)
+// returns): a real server sends this again immediately after the
+// handshake completes, this time carrying only custom/server-defined
+// items (none, for this project) rather than the full vanilla table.
+void sendEmptyItemRegistry(int sock, sockaddr_in clientAddr, ClientState& state);

@@ -63,6 +63,8 @@ void loadConfig(const string& path) {
                 g_config.protocolVersion = stoi(value);
             } else if (key == "version-name") {
                 g_config.versionName = value;
+            } else if (key == "enable-commands") {
+                g_config.enableCommands = (value == "true" || value == "1" || value == "yes");
             } else {
                 cout << "[Config] Unknown key '" << key << "' on line "
                      << lineNumber << " - ignored\n";

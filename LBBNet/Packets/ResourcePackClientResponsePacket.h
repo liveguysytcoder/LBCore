@@ -40,3 +40,8 @@ void completeResourcePackStageAndStartGame(int sock, sockaddr_in clientAddr, Cli
 // with ChunkRadiusUpdated. Guarded by state.spawnSequenceSent so a client
 // that sends RequestChunkRadius more than once doesn't get it all resent.
 void sendSpawnSequence(int sock, sockaddr_in clientAddr, ClientState& state);
+
+// Second half of the spawn sequence: biomes, attributes, player list, world
+// state, inventories, commands and the initial chunks. Runs at most once per
+// client. `trigger` is only used for logging (which event released it).
+void sendSpawnSequencePhase2(int sock, sockaddr_in clientAddr, ClientState& state, const char* trigger);

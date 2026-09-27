@@ -5,6 +5,7 @@
 #include <cstring>
 #include <vector>
 #include "Server.h"
+#include "../../LBBNet/Packets/DisconnectPacket.h"
 #include "../../Config/Config.h"
 
 using namespace std;
@@ -80,10 +81,18 @@ void start() {
             cout << "\n";
 
             vector<unsigned char> data(buffer, buffer + bytesReceived);
-            decodePacket(serverSocket, clientAddr, data);
+            try {
+                decodePacket(serverSocket, clientAddr, data);
+            } catch (const std::exception& e) {
+                // A malformed packet must never take the whole server down.
+                cout << "[ERROR] Dropped malformed packet from "
+                     << inet_ntoa(clientAddr.sin_addr) << ":" << ntohs(clientAddr.sin_port)
+                     << " (" << e.what() << ")\n";
+            }
         }
     }
 
+    disconnectAllClients(68 /* Shutdown */, "Server closed");
     cout << "[INFO] Server stopped.\n";
 
     if (serverSocket != -1) {

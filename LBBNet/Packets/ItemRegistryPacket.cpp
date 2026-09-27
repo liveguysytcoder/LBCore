@@ -26,3 +26,11 @@ void sendItemRegistry(int sock, sockaddr_in clientAddr, ClientState& state) {
     queueGamePacket(state, packet);
     cout << "[Bedrock] Sent ItemRegistry (" << kItemRegistryBodyLen << " bytes, 1934 items)\n";
 }
+
+void sendEmptyItemRegistry(int sock, sockaddr_in clientAddr, ClientState& state) {
+    vector<uint8_t> packet;
+    writeVarInt(packet, 162); // ItemRegistry
+    writeVarInt(packet, 0);   // Item Data: array count = 0 (no custom items)
+    queueGamePacket(state, packet);
+    cout << "[Bedrock] Sent ItemRegistry (2nd time, empty -- custom items only)\n";
+}
