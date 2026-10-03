@@ -43,6 +43,16 @@ Supporting components include:
 
 This is an active, work-in-progress reimplementation of the Bedrock protocol — expect missing features and breaking changes as packet coverage expands.
 
+## Donation
+
+If you want to donate you can donate here! 
+Indian people's here or who have UPI payment system
+here is my UPI ID
+8473890253@slc
+If you are a International Person
+than you can pay me here through Crypto currency Wallet
+if you want my Crypto wallet address to pay, than mail me on liveguys406@gmail.com
+
 ## Building
 
 Requires CMake 3.10+, a C++17 compiler, OpenSSL, and zlib.
